@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="en" dir="auto" data-theme="light">
+
+<head><meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+<meta name="robots" content="index, follow">
+<title>Panasonic Let&#39;s note SV1 Linux风扇问题解决 | forcol的日记</title>
+<meta name="keywords" content="linux">
+<meta name="description" content="
+
+前言
+
+
+最近入手了一款外观复古的松下机器。想着把linux装在上面，但只要一进linux系统，风扇便开始狂转，吵得难以使用下去。
+
+一开始以为是驱动的问题，但手动编译了多次内核依然如故，于是便在网上另辟蹊径。经过一番苦苦搜索，最终在这里发现了解决问题的思路：
+
+  #!/bin/shell
+  c(){ echo &#34;$1&#34; | tee /proc/acpi/call &gt;/dev/null &amp;&amp; cat /proc/acpi/call;echo;}
+  c &#39;\_SB.PCI0.LPCB.EC0.EC88 0xB5 0x79 0x05 0x00&#39;
+  c &#39;\_SB.PCI0.LPCB.EC0.TFN1._FSL 0&#39;
+
+原文作者说在他的QV9和SR4上面 0xB5 0x79 0x05 0x00 能将风扇设置为静音模式， _FSL 能手动设置风扇速度（上述PCI0在我的SV1上需要换成PC00）。
+
+不过可惜的是， 发送 0xB5 0x79 0x05 0x00 后，电脑直接关闭风扇了。又再折腾几次，发觉该指令在我机器上反倒类似于获取风扇控制权，无奈只好往手动控制风扇上开拓思路。
+
+藉由AI的帮助，用rust勉强完成了一个还算能用的风扇守护程序：
+
+  use std::fs::{self, File};
+  use std::io;
+  use std::os::unix::fs::FileExt;
+  use std::path::{Path, PathBuf};
+  use std::sync::atomic::{AtomicBool, Ordering};
+  use std::time::{Duration, Instant};
+
+  const ACPI:     &amp;str     = &#34;/proc/acpi/call&#34;;
+  const EC_ON:    &amp;[u8]    = b&#34;\\_SB.PC00.LPCB.EC0.EC88 0xB5 0x79 0x05 0x00&#34;;
+  const EC_OFF:   &amp;[u8]    = b&#34;\\_SB.PC00.LPCB.EC0.EC88 0xB5 0x79 0x00 0x00&#34;;
+  const COOLDOWN: Duration = Duration::from_secs(2);
+  const RETRY:    Duration = Duration::from_secs(1);
+
+  struct Tier { up: i32, dn: i32, cmd: &amp;&#39;static [u8], poll: Duration }
+
+  const TIERS: &amp;[Tier] = &amp;[
+      Tier { up: 100, dn: 77, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 100&#34;, poll: Duration::from_millis(300)  },
+      Tier { up: 85,  dn: 67, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 90&#34;,  poll: Duration::from_millis(500)  },
+      Tier { up: 75,  dn: 59, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 75&#34;,  poll: Duration::from_millis(800)  },
+      Tier { up: 68,  dn: 53, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 62&#34;,  poll: Duration::from_millis(1000) },
+      Tier { up: 62,  dn: 48, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 55&#34;,  poll: Duration::from_millis(1000) },
+      Tier { up: 57,  dn: 41, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 50&#34;,  poll: Duration::from_millis(1000) },
+      Tier { up: 50,  dn: 34, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 45&#34;,  poll: Duration::from_millis(1000) },
+      Tier { up: 43,  dn: 0,  cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 40&#34;,  poll: Duration::from_millis(1000) },
+  ];
+
+  static RUNNING: AtomicBool = AtomicBool::new(true);
+
+  extern &#34;C&#34; fn stop(_: libc::c_int) {
+      RUNNING.store(false, Ordering::Relaxed);
+  }
+
+  struct Devices {
+      acpi:   File,
+      temp:   File,
+      smooth: Option&lt;i32&gt;,
+  }
+
+  impl Devices {
+      // 构造即代表&#34;EC_ON 已成功发出&#34;，Drop 发送 EC_OFF 的前提由此保证
+      fn open(tp: &amp;Path, tier_cmd: &amp;[u8]) -&gt; Option&lt;Self&gt; {
+          let acpi = File::options().write(true).open(ACPI).ok()?;
+          acpi.write_at(EC_ON,    0).ok()?;
+          acpi.write_at(tier_cmd, 0).ok()?;
+          Some(Self {
+              acpi,
+              temp:   File::open(tp).ok()?,
+              smooth: None,
+          })
+      }
+
+      fn write_acpi(&amp;self, cmd: &amp;[u8]) -&gt; io::Result&lt;()&gt; {
+          self.acpi.write_at(cmd, 0).map(|_| ())
+      }
+
+      fn read_temp(&amp;self) -&gt; Option&lt;i32&gt; {
+          let mut buf = [0u8; 16];
+          let n = self.temp.read_at(&amp;mut buf, 0).ok()?;
+          std::str::from_utf8(&amp;buf[..n]).ok()?
+              .trim()
+              .parse::&lt;i32&gt;().ok()
+              .map(|v| v / 1000)
+      }
+  }
+
+  // Devices 存在 ⟺ EC_ON 已激活，生命周期与资源激活周期精确对应
+  impl Drop for Devices {
+      fn drop(&amp;mut self) {
+          let _ = self.acpi.write_at(EC_OFF, 0);
+      }
+  }
+
+  fn find_temp_path() -&gt; PathBuf {
+      fs::read_dir(&#34;/sys/class/thermal&#34;)
+          .expect(&#34;Cannot read /sys/class/thermal&#34;)
+          .filter_map(|e| e.ok())
+          .find_map(|e| {
+              let mut p = e.path();
+              p.push(&#34;type&#34;);
+              let ok = fs::read_to_string(&amp;p).is_ok_and(|t| t.contains(&#34;pkg_temp&#34;));
+              p.set_file_name(&#34;temp&#34;);
+              ok.then_some(p)
+          })
+          .expect(&#34;No pkg_temp thermal zone&#34;)
+  }
+
+  fn decide(lvl: usize, s: i32, elapsed: Duration) -&gt; usize {
+      if lvl &gt; 0 &amp;&amp; s &gt;= TIERS[lvl].up {
+          return (0..lvl).rev().find(|&amp;i| s &lt; TIERS[i].up).unwrap_or(0);
+      }
+      if s &lt; TIERS[lvl].dn &amp;&amp; elapsed &gt; COOLDOWN {
+          return (lvl..TIERS.len()).find(|&amp;i| s &gt;= TIERS[i].dn).unwrap();
+      }
+      lvl
+  }
+
+  fn tick(d: &amp;mut Devices, lvl: usize, elapsed: Duration) -&gt; Option&lt;usize&gt; {
+      let temp = d.read_temp()?;
+      let s = d.smooth.get_or_insert(temp);
+      ,*s = if temp &gt; *s { (temp &#43; *s &#43; 1) &gt;&gt; 1 } else { (temp &#43; 7 * *s &#43; 4) &gt;&gt; 3 };
+      let new = decide(lvl, *s, elapsed);
+      if new != lvl &amp;&amp; d.write_acpi(TIERS[new].cmd).is_err() { return None; }
+      Some(new)
+  }
+
+  fn main() {
+      if unsafe { libc::geteuid() } != 0 {
+          eprintln!(&#34;Root required&#34;);
+          std::process::exit(1);
+      }
+
+      unsafe {
+          let mut sa: libc::sigaction = std::mem::zeroed();
+          sa.sa_sigaction = stop as *const () as libc::sighandler_t;
+          libc::sigaction(libc::SIGINT,  &amp;sa, std::ptr::null_mut());
+          libc::sigaction(libc::SIGTERM, &amp;sa, std::ptr::null_mut());
+      }
+
+      let tp = find_temp_path();
+
+      let mut devices: Option&lt;Devices&gt; = None;
+      let mut lvl  = TIERS.len() - 1;
+      let mut last = Instant::now() - COOLDOWN;
+
+      while RUNNING.load(Ordering::Relaxed) {
+
+          // ── 长效句柄：仅在断开时重建 ─────────────────────────────────────
+          if devices.is_none() {
+              match Devices::open(&amp;tp, TIERS[lvl].cmd) {
+                  None    =&gt; { std::thread::sleep(RETRY); continue; }
+                  Some(d) =&gt; { devices = Some(d); }
+              }
+          }
+
+          // ── 采样、决策、写入 ─────────────────────────────────────────────
+          let now = Instant::now();
+          let d = devices.as_mut().expect(&#34;devices guaranteed Some after setup&#34;);
+          match tick(d, lvl, now.duration_since(last)) {
+              Some(new) =&gt; {
+                  if new != lvl { lvl = new; last = now; }
+              }
+              None =&gt; { devices = None; continue; }
+          }
+
+          std::thread::sleep(TIERS[lvl].poll);
+      }
+
+      // devices 在此 drop，Drop impl 自动发送 EC_OFF
+  }
+
+
+
+
+
+具体步骤
+
+
+
+安装acpi_call内核模块，确定 lsmod | grep acpi_call 会输出acpi_call
+
+编译rust代码，个人所用的Cargo.toml为：">
+<meta name="author" content="">
+<link rel="canonical" href="https://forcol.github.io/posts/panasonic-lets-note-sv1-linux%E9%A3%8E%E6%89%87%E9%97%AE%E9%A2%98%E8%A7%A3%E5%86%B3/">
+<link crossorigin="anonymous" href="/assets/css/stylesheet.css" rel="preload stylesheet" as="style">
+<link rel="icon" href="https://forcol.github.io/favicon.ico">
+<link rel="icon" type="image/png" sizes="16x16" href="https://forcol.github.io/favicon-16x16.png">
+<link rel="icon" type="image/png" sizes="32x32" href="https://forcol.github.io/favicon-32x32.png">
+<link rel="apple-touch-icon" href="https://forcol.github.io/apple-touch-icon.png">
+<link rel="mask-icon" href="https://forcol.github.io/safari-pinned-tab.svg">
+<meta name="theme-color" content="#2e2e33">
+<meta name="msapplication-TileColor" content="#2e2e33">
+<link rel="alternate" hreflang="en" href="https://forcol.github.io/posts/panasonic-lets-note-sv1-linux%E9%A3%8E%E6%89%87%E9%97%AE%E9%A2%98%E8%A7%A3%E5%86%B3/">
+<noscript>
+    <style>
+        #theme-toggle,
+        .top-link {
+            display: none;
+        }
+
+    </style>
+</noscript><meta property="og:url" content="https://forcol.github.io/posts/panasonic-lets-note-sv1-linux%E9%A3%8E%E6%89%87%E9%97%AE%E9%A2%98%E8%A7%A3%E5%86%B3/">
+  <meta property="og:site_name" content="forcol的日记">
+  <meta property="og:title" content="Panasonic Let&#39;s note SV1 Linux风扇问题解决">
+  <meta property="og:description" content="前言 最近入手了一款外观复古的松下机器。想着把linux装在上面，但只要一进linux系统，风扇便开始狂转，吵得难以使用下去。
+一开始以为是驱动的问题，但手动编译了多次内核依然如故，于是便在网上另辟蹊径。经过一番苦苦搜索，最终在这里发现了解决问题的思路：
+#!/bin/shell c(){ echo &#34;$1&#34; | tee /proc/acpi/call &gt;/dev/null &amp;&amp; cat /proc/acpi/call;echo;} c &#39;\_SB.PCI0.LPCB.EC0.EC88 0xB5 0x79 0x05 0x00&#39; c &#39;\_SB.PCI0.LPCB.EC0.TFN1._FSL 0&#39; 原文作者说在他的QV9和SR4上面 0xB5 0x79 0x05 0x00 能将风扇设置为静音模式， _FSL 能手动设置风扇速度（上述PCI0在我的SV1上需要换成PC00）。
+不过可惜的是， 发送 0xB5 0x79 0x05 0x00 后，电脑直接关闭风扇了。又再折腾几次，发觉该指令在我机器上反倒类似于获取风扇控制权，无奈只好往手动控制风扇上开拓思路。
+藉由AI的帮助，用rust勉强完成了一个还算能用的风扇守护程序：
+use std::fs::{self, File}; use std::io; use std::os::unix::fs::FileExt; use std::path::{Path, PathBuf}; use std::sync::atomic::{AtomicBool, Ordering}; use std::time::{Duration, Instant}; const ACPI: &amp;str = &#34;/proc/acpi/call&#34;; const EC_ON: &amp;[u8] = b&#34;\\_SB.PC00.LPCB.EC0.EC88 0xB5 0x79 0x05 0x00&#34;; const EC_OFF: &amp;[u8] = b&#34;\\_SB.PC00.LPCB.EC0.EC88 0xB5 0x79 0x00 0x00&#34;; const COOLDOWN: Duration = Duration::from_secs(2); const RETRY: Duration = Duration::from_secs(1); struct Tier { up: i32, dn: i32, cmd: &amp;&#39;static [u8], poll: Duration } const TIERS: &amp;[Tier] = &amp;[ Tier { up: 100, dn: 77, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 100&#34;, poll: Duration::from_millis(300) }, Tier { up: 85, dn: 67, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 90&#34;, poll: Duration::from_millis(500) }, Tier { up: 75, dn: 59, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 75&#34;, poll: Duration::from_millis(800) }, Tier { up: 68, dn: 53, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 62&#34;, poll: Duration::from_millis(1000) }, Tier { up: 62, dn: 48, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 55&#34;, poll: Duration::from_millis(1000) }, Tier { up: 57, dn: 41, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 50&#34;, poll: Duration::from_millis(1000) }, Tier { up: 50, dn: 34, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 45&#34;, poll: Duration::from_millis(1000) }, Tier { up: 43, dn: 0, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 40&#34;, poll: Duration::from_millis(1000) }, ]; static RUNNING: AtomicBool = AtomicBool::new(true); extern &#34;C&#34; fn stop(_: libc::c_int) { RUNNING.store(false, Ordering::Relaxed); } struct Devices { acpi: File, temp: File, smooth: Option&lt;i32&gt;, } impl Devices { // 构造即代表&#34;EC_ON 已成功发出&#34;，Drop 发送 EC_OFF 的前提由此保证 fn open(tp: &amp;Path, tier_cmd: &amp;[u8]) -&gt; Option&lt;Self&gt; { let acpi = File::options().write(true).open(ACPI).ok()?; acpi.write_at(EC_ON, 0).ok()?; acpi.write_at(tier_cmd, 0).ok()?; Some(Self { acpi, temp: File::open(tp).ok()?, smooth: None, }) } fn write_acpi(&amp;self, cmd: &amp;[u8]) -&gt; io::Result&lt;()&gt; { self.acpi.write_at(cmd, 0).map(|_| ()) } fn read_temp(&amp;self) -&gt; Option&lt;i32&gt; { let mut buf = [0u8; 16]; let n = self.temp.read_at(&amp;mut buf, 0).ok()?; std::str::from_utf8(&amp;buf[..n]).ok()? .trim() .parse::&lt;i32&gt;().ok() .map(|v| v / 1000) } } // Devices 存在 ⟺ EC_ON 已激活，生命周期与资源激活周期精确对应 impl Drop for Devices { fn drop(&amp;mut self) { let _ = self.acpi.write_at(EC_OFF, 0); } } fn find_temp_path() -&gt; PathBuf { fs::read_dir(&#34;/sys/class/thermal&#34;) .expect(&#34;Cannot read /sys/class/thermal&#34;) .filter_map(|e| e.ok()) .find_map(|e| { let mut p = e.path(); p.push(&#34;type&#34;); let ok = fs::read_to_string(&amp;p).is_ok_and(|t| t.contains(&#34;pkg_temp&#34;)); p.set_file_name(&#34;temp&#34;); ok.then_some(p) }) .expect(&#34;No pkg_temp thermal zone&#34;) } fn decide(lvl: usize, s: i32, elapsed: Duration) -&gt; usize { if lvl &gt; 0 &amp;&amp; s &gt;= TIERS[lvl].up { return (0..lvl).rev().find(|&amp;i| s &lt; TIERS[i].up).unwrap_or(0); } if s &lt; TIERS[lvl].dn &amp;&amp; elapsed &gt; COOLDOWN { return (lvl..TIERS.len()).find(|&amp;i| s &gt;= TIERS[i].dn).unwrap(); } lvl } fn tick(d: &amp;mut Devices, lvl: usize, elapsed: Duration) -&gt; Option&lt;usize&gt; { let temp = d.read_temp()?; let s = d.smooth.get_or_insert(temp); ,*s = if temp &gt; *s { (temp &#43; *s &#43; 1) &gt;&gt; 1 } else { (temp &#43; 7 * *s &#43; 4) &gt;&gt; 3 }; let new = decide(lvl, *s, elapsed); if new != lvl &amp;&amp; d.write_acpi(TIERS[new].cmd).is_err() { return None; } Some(new) } fn main() { if unsafe { libc::geteuid() } != 0 { eprintln!(&#34;Root required&#34;); std::process::exit(1); } unsafe { let mut sa: libc::sigaction = std::mem::zeroed(); sa.sa_sigaction = stop as *const () as libc::sighandler_t; libc::sigaction(libc::SIGINT, &amp;sa, std::ptr::null_mut()); libc::sigaction(libc::SIGTERM, &amp;sa, std::ptr::null_mut()); } let tp = find_temp_path(); let mut devices: Option&lt;Devices&gt; = None; let mut lvl = TIERS.len() - 1; let mut last = Instant::now() - COOLDOWN; while RUNNING.load(Ordering::Relaxed) { // ── 长效句柄：仅在断开时重建 ───────────────────────────────────── if devices.is_none() { match Devices::open(&amp;tp, TIERS[lvl].cmd) { None =&gt; { std::thread::sleep(RETRY); continue; } Some(d) =&gt; { devices = Some(d); } } } // ── 采样、决策、写入 ───────────────────────────────────────────── let now = Instant::now(); let d = devices.as_mut().expect(&#34;devices guaranteed Some after setup&#34;); match tick(d, lvl, now.duration_since(last)) { Some(new) =&gt; { if new != lvl { lvl = new; last = now; } } None =&gt; { devices = None; continue; } } std::thread::sleep(TIERS[lvl].poll); } // devices 在此 drop，Drop impl 自动发送 EC_OFF } 具体步骤 安装acpi_call内核模块，确定 lsmod | grep acpi_call 会输出acpi_call 编译rust代码，个人所用的Cargo.toml为：">
+  <meta property="og:locale" content="en">
+  <meta property="og:type" content="article">
+    <meta property="article:section" content="posts">
+    <meta property="article:tag" content="Linux">
+
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Panasonic Let&#39;s note SV1 Linux风扇问题解决">
+  <meta name="twitter:description" content="前言 最近入手了一款外观复古的松下机器。想着把linux装在上面，但只要一进linux系统，风扇便开始狂转，吵得难以使用下去。
+一开始以为是驱动的问题，但手动编译了多次内核依然如故，于是便在网上另辟蹊径。经过一番苦苦搜索，最终在这里发现了解决问题的思路：
+#!/bin/shell c(){ echo &#34;$1&#34; | tee /proc/acpi/call &gt;/dev/null &amp;&amp; cat /proc/acpi/call;echo;} c &#39;\_SB.PCI0.LPCB.EC0.EC88 0xB5 0x79 0x05 0x00&#39; c &#39;\_SB.PCI0.LPCB.EC0.TFN1._FSL 0&#39; 原文作者说在他的QV9和SR4上面 0xB5 0x79 0x05 0x00 能将风扇设置为静音模式， _FSL 能手动设置风扇速度（上述PCI0在我的SV1上需要换成PC00）。
+不过可惜的是， 发送 0xB5 0x79 0x05 0x00 后，电脑直接关闭风扇了。又再折腾几次，发觉该指令在我机器上反倒类似于获取风扇控制权，无奈只好往手动控制风扇上开拓思路。
+藉由AI的帮助，用rust勉强完成了一个还算能用的风扇守护程序：
+use std::fs::{self, File}; use std::io; use std::os::unix::fs::FileExt; use std::path::{Path, PathBuf}; use std::sync::atomic::{AtomicBool, Ordering}; use std::time::{Duration, Instant}; const ACPI: &amp;str = &#34;/proc/acpi/call&#34;; const EC_ON: &amp;[u8] = b&#34;\\_SB.PC00.LPCB.EC0.EC88 0xB5 0x79 0x05 0x00&#34;; const EC_OFF: &amp;[u8] = b&#34;\\_SB.PC00.LPCB.EC0.EC88 0xB5 0x79 0x00 0x00&#34;; const COOLDOWN: Duration = Duration::from_secs(2); const RETRY: Duration = Duration::from_secs(1); struct Tier { up: i32, dn: i32, cmd: &amp;&#39;static [u8], poll: Duration } const TIERS: &amp;[Tier] = &amp;[ Tier { up: 100, dn: 77, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 100&#34;, poll: Duration::from_millis(300) }, Tier { up: 85, dn: 67, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 90&#34;, poll: Duration::from_millis(500) }, Tier { up: 75, dn: 59, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 75&#34;, poll: Duration::from_millis(800) }, Tier { up: 68, dn: 53, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 62&#34;, poll: Duration::from_millis(1000) }, Tier { up: 62, dn: 48, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 55&#34;, poll: Duration::from_millis(1000) }, Tier { up: 57, dn: 41, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 50&#34;, poll: Duration::from_millis(1000) }, Tier { up: 50, dn: 34, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 45&#34;, poll: Duration::from_millis(1000) }, Tier { up: 43, dn: 0, cmd: b&#34;\\_SB.PC00.LPCB.EC0.TFN1._FSL 40&#34;, poll: Duration::from_millis(1000) }, ]; static RUNNING: AtomicBool = AtomicBool::new(true); extern &#34;C&#34; fn stop(_: libc::c_int) { RUNNING.store(false, Ordering::Relaxed); } struct Devices { acpi: File, temp: File, smooth: Option&lt;i32&gt;, } impl Devices { // 构造即代表&#34;EC_ON 已成功发出&#34;，Drop 发送 EC_OFF 的前提由此保证 fn open(tp: &amp;Path, tier_cmd: &amp;[u8]) -&gt; Option&lt;Self&gt; { let acpi = File::options().write(true).open(ACPI).ok()?; acpi.write_at(EC_ON, 0).ok()?; acpi.write_at(tier_cmd, 0).ok()?; Some(Self { acpi, temp: File::open(tp).ok()?, smooth: None, }) } fn write_acpi(&amp;self, cmd: &amp;[u8]) -&gt; io::Result&lt;()&gt; { self.acpi.write_at(cmd, 0).map(|_| ()) } fn read_temp(&amp;self) -&gt; Option&lt;i32&gt; { let mut buf = [0u8; 16]; let n = self.temp.read_at(&amp;mut buf, 0).ok()?; std::str::from_utf8(&amp;buf[..n]).ok()? .trim() .parse::&lt;i32&gt;().ok() .map(|v| v / 1000) } } // Devices 存在 ⟺ EC_ON 已激活，生命周期与资源激活周期精确对应 impl Drop for Devices { fn drop(&amp;mut self) { let _ = self.acpi.write_at(EC_OFF, 0); } } fn find_temp_path() -&gt; PathBuf { fs::read_dir(&#34;/sys/class/thermal&#34;) .expect(&#34;Cannot read /sys/class/thermal&#34;) .filter_map(|e| e.ok()) .find_map(|e| { let mut p = e.path(); p.push(&#34;type&#34;); let ok = fs::read_to_string(&amp;p).is_ok_and(|t| t.contains(&#34;pkg_temp&#34;)); p.set_file_name(&#34;temp&#34;); ok.then_some(p) }) .expect(&#34;No pkg_temp thermal zone&#34;) } fn decide(lvl: usize, s: i32, elapsed: Duration) -&gt; usize { if lvl &gt; 0 &amp;&amp; s &gt;= TIERS[lvl].up { return (0..lvl).rev().find(|&amp;i| s &lt; TIERS[i].up).unwrap_or(0); } if s &lt; TIERS[lvl].dn &amp;&amp; elapsed &gt; COOLDOWN { return (lvl..TIERS.len()).find(|&amp;i| s &gt;= TIERS[i].dn).unwrap(); } lvl } fn tick(d: &amp;mut Devices, lvl: usize, elapsed: Duration) -&gt; Option&lt;usize&gt; { let temp = d.read_temp()?; let s = d.smooth.get_or_insert(temp); ,*s = if temp &gt; *s { (temp &#43; *s &#43; 1) &gt;&gt; 1 } else { (temp &#43; 7 * *s &#43; 4) &gt;&gt; 3 }; let new = decide(lvl, *s, elapsed); if new != lvl &amp;&amp; d.write_acpi(TIERS[new].cmd).is_err() { return None; } Some(new) } fn main() { if unsafe { libc::geteuid() } != 0 { eprintln!(&#34;Root required&#34;); std::process::exit(1); } unsafe { let mut sa: libc::sigaction = std::mem::zeroed(); sa.sa_sigaction = stop as *const () as libc::sighandler_t; libc::sigaction(libc::SIGINT, &amp;sa, std::ptr::null_mut()); libc::sigaction(libc::SIGTERM, &amp;sa, std::ptr::null_mut()); } let tp = find_temp_path(); let mut devices: Option&lt;Devices&gt; = None; let mut lvl = TIERS.len() - 1; let mut last = Instant::now() - COOLDOWN; while RUNNING.load(Ordering::Relaxed) { // ── 长效句柄：仅在断开时重建 ───────────────────────────────────── if devices.is_none() { match Devices::open(&amp;tp, TIERS[lvl].cmd) { None =&gt; { std::thread::sleep(RETRY); continue; } Some(d) =&gt; { devices = Some(d); } } } // ── 采样、决策、写入 ───────────────────────────────────────────── let now = Instant::now(); let d = devices.as_mut().expect(&#34;devices guaranteed Some after setup&#34;); match tick(d, lvl, now.duration_since(last)) { Some(new) =&gt; { if new != lvl { lvl = new; last = now; } } None =&gt; { devices = None; continue; } } std::thread::sleep(TIERS[lvl].poll); } // devices 在此 drop，Drop impl 自动发送 EC_OFF } 具体步骤 安装acpi_call内核模块，确定 lsmod | grep acpi_call 会输出acpi_call 编译rust代码，个人所用的Cargo.toml为：">
+
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {
+      "@type": "ListItem",
+      "position":  1 ,
+      "name": "Posts",
+      "item": "https://forcol.github.io/posts/"
+    }, 
+    {
+      "@type": "ListItem",
+      "position":  2 ,
+      "name": "Panasonic Let's note SV1 Linux风扇问题解决",
+      "item": "https://forcol.github.io/posts/panasonic-lets-note-sv1-linux%E9%A3%8E%E6%89%87%E9%97%AE%E9%A2%98%E8%A7%A3%E5%86%B3/"
+    }
+  ]
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "Panasonic Let's note SV1 Linux风扇问题解决",
+  "name": "Panasonic Let\u0027s note SV1 Linux风扇问题解决",
+  "description": " 前言 最近入手了一款外观复古的松下机器。想着把linux装在上面，但只要一进linux系统，风扇便开始狂转，吵得难以使用下去。\n一开始以为是驱动的问题，但手动编译了多次内核依然如故，于是便在网上另辟蹊径。经过一番苦苦搜索，最终在这里发现了解决问题的思路：\n#!/bin/shell c(){ echo \u0026#34;$1\u0026#34; | tee /proc/acpi/call \u0026gt;/dev/null \u0026amp;\u0026amp; cat /proc/acpi/call;echo;} c \u0026#39;\\_SB.PCI0.LPCB.EC0.EC88 0xB5 0x79 0x05 0x00\u0026#39; c \u0026#39;\\_SB.PCI0.LPCB.EC0.TFN1._FSL 0\u0026#39; 原文作者说在他的QV9和SR4上面 0xB5 0x79 0x05 0x00 能将风扇设置为静音模式， _FSL 能手动设置风扇速度（上述PCI0在我的SV1上需要换成PC00）。\n不过可惜的是， 发送 0xB5 0x79 0x05 0x00 后，电脑直接关闭风扇了。又再折腾几次，发觉该指令在我机器上反倒类似于获取风扇控制权，无奈只好往手动控制风扇上开拓思路。\n藉由AI的帮助，用rust勉强完成了一个还算能用的风扇守护程序：\nuse std::fs::{self, File}; use std::io; use std::os::unix::fs::FileExt; use std::path::{Path, PathBuf}; use std::sync::atomic::{AtomicBool, Ordering}; use std::time::{Duration, Instant}; const ACPI: \u0026amp;str = \u0026#34;/proc/acpi/call\u0026#34;; const EC_ON: \u0026amp;[u8] = b\u0026#34;\\\\_SB.PC00.LPCB.EC0.EC88 0xB5 0x79 0x05 0x00\u0026#34;; const EC_OFF: \u0026amp;[u8] = b\u0026#34;\\\\_SB.PC00.LPCB.EC0.EC88 0xB5 0x79 0x00 0x00\u0026#34;; const COOLDOWN: Duration = Duration::from_secs(2); const RETRY: Duration = Duration::from_secs(1); struct Tier { up: i32, dn: i32, cmd: \u0026amp;\u0026#39;static [u8], poll: Duration } const TIERS: \u0026amp;[Tier] = \u0026amp;[ Tier { up: 100, dn: 77, cmd: b\u0026#34;\\\\_SB.PC00.LPCB.EC0.TFN1._FSL 100\u0026#34;, poll: Duration::from_millis(300) }, Tier { up: 85, dn: 67, cmd: b\u0026#34;\\\\_SB.PC00.LPCB.EC0.TFN1._FSL 90\u0026#34;, poll: Duration::from_millis(500) }, Tier { up: 75, dn: 59, cmd: b\u0026#34;\\\\_SB.PC00.LPCB.EC0.TFN1._FSL 75\u0026#34;, poll: Duration::from_millis(800) }, Tier { up: 68, dn: 53, cmd: b\u0026#34;\\\\_SB.PC00.LPCB.EC0.TFN1._FSL 62\u0026#34;, poll: Duration::from_millis(1000) }, Tier { up: 62, dn: 48, cmd: b\u0026#34;\\\\_SB.PC00.LPCB.EC0.TFN1._FSL 55\u0026#34;, poll: Duration::from_millis(1000) }, Tier { up: 57, dn: 41, cmd: b\u0026#34;\\\\_SB.PC00.LPCB.EC0.TFN1._FSL 50\u0026#34;, poll: Duration::from_millis(1000) }, Tier { up: 50, dn: 34, cmd: b\u0026#34;\\\\_SB.PC00.LPCB.EC0.TFN1._FSL 45\u0026#34;, poll: Duration::from_millis(1000) }, Tier { up: 43, dn: 0, cmd: b\u0026#34;\\\\_SB.PC00.LPCB.EC0.TFN1._FSL 40\u0026#34;, poll: Duration::from_millis(1000) }, ]; static RUNNING: AtomicBool = AtomicBool::new(true); extern \u0026#34;C\u0026#34; fn stop(_: libc::c_int) { RUNNING.store(false, Ordering::Relaxed); } struct Devices { acpi: File, temp: File, smooth: Option\u0026lt;i32\u0026gt;, } impl Devices { // 构造即代表\u0026#34;EC_ON 已成功发出\u0026#34;，Drop 发送 EC_OFF 的前提由此保证 fn open(tp: \u0026amp;Path, tier_cmd: \u0026amp;[u8]) -\u0026gt; Option\u0026lt;Self\u0026gt; { let acpi = File::options().write(true).open(ACPI).ok()?; acpi.write_at(EC_ON, 0).ok()?; acpi.write_at(tier_cmd, 0).ok()?; Some(Self { acpi, temp: File::open(tp).ok()?, smooth: None, }) } fn write_acpi(\u0026amp;self, cmd: \u0026amp;[u8]) -\u0026gt; io::Result\u0026lt;()\u0026gt; { self.acpi.write_at(cmd, 0).map(|_| ()) } fn read_temp(\u0026amp;self) -\u0026gt; Option\u0026lt;i32\u0026gt; { let mut buf = [0u8; 16]; let n = self.temp.read_at(\u0026amp;mut buf, 0).ok()?; std::str::from_utf8(\u0026amp;buf[..n]).ok()? .trim() .parse::\u0026lt;i32\u0026gt;().ok() .map(|v| v / 1000) } } // Devices 存在 ⟺ EC_ON 已激活，生命周期与资源激活周期精确对应 impl Drop for Devices { fn drop(\u0026amp;mut self) { let _ = self.acpi.write_at(EC_OFF, 0); } } fn find_temp_path() -\u0026gt; PathBuf { fs::read_dir(\u0026#34;/sys/class/thermal\u0026#34;) .expect(\u0026#34;Cannot read /sys/class/thermal\u0026#34;) .filter_map(|e| e.ok()) .find_map(|e| { let mut p = e.path(); p.push(\u0026#34;type\u0026#34;); let ok = fs::read_to_string(\u0026amp;p).is_ok_and(|t| t.contains(\u0026#34;pkg_temp\u0026#34;)); p.set_file_name(\u0026#34;temp\u0026#34;); ok.then_some(p) }) .expect(\u0026#34;No pkg_temp thermal zone\u0026#34;) } fn decide(lvl: usize, s: i32, elapsed: Duration) -\u0026gt; usize { if lvl \u0026gt; 0 \u0026amp;\u0026amp; s \u0026gt;= TIERS[lvl].up { return (0..lvl).rev().find(|\u0026amp;i| s \u0026lt; TIERS[i].up).unwrap_or(0); } if s \u0026lt; TIERS[lvl].dn \u0026amp;\u0026amp; elapsed \u0026gt; COOLDOWN { return (lvl..TIERS.len()).find(|\u0026amp;i| s \u0026gt;= TIERS[i].dn).unwrap(); } lvl } fn tick(d: \u0026amp;mut Devices, lvl: usize, elapsed: Duration) -\u0026gt; Option\u0026lt;usize\u0026gt; { let temp = d.read_temp()?; let s = d.smooth.get_or_insert(temp); ,*s = if temp \u0026gt; *s { (temp + *s + 1) \u0026gt;\u0026gt; 1 } else { (temp + 7 * *s + 4) \u0026gt;\u0026gt; 3 }; let new = decide(lvl, *s, elapsed); if new != lvl \u0026amp;\u0026amp; d.write_acpi(TIERS[new].cmd).is_err() { return None; } Some(new) } fn main() { if unsafe { libc::geteuid() } != 0 { eprintln!(\u0026#34;Root required\u0026#34;); std::process::exit(1); } unsafe { let mut sa: libc::sigaction = std::mem::zeroed(); sa.sa_sigaction = stop as *const () as libc::sighandler_t; libc::sigaction(libc::SIGINT, \u0026amp;sa, std::ptr::null_mut()); libc::sigaction(libc::SIGTERM, \u0026amp;sa, std::ptr::null_mut()); } let tp = find_temp_path(); let mut devices: Option\u0026lt;Devices\u0026gt; = None; let mut lvl = TIERS.len() - 1; let mut last = Instant::now() - COOLDOWN; while RUNNING.load(Ordering::Relaxed) { // ── 长效句柄：仅在断开时重建 ───────────────────────────────────── if devices.is_none() { match Devices::open(\u0026amp;tp, TIERS[lvl].cmd) { None =\u0026gt; { std::thread::sleep(RETRY); continue; } Some(d) =\u0026gt; { devices = Some(d); } } } // ── 采样、决策、写入 ───────────────────────────────────────────── let now = Instant::now(); let d = devices.as_mut().expect(\u0026#34;devices guaranteed Some after setup\u0026#34;); match tick(d, lvl, now.duration_since(last)) { Some(new) =\u0026gt; { if new != lvl { lvl = new; last = now; } } None =\u0026gt; { devices = None; continue; } } std::thread::sleep(TIERS[lvl].poll); } // devices 在此 drop，Drop impl 自动发送 EC_OFF } 具体步骤 安装acpi_call内核模块，确定 lsmod | grep acpi_call 会输出acpi_call 编译rust代码，个人所用的Cargo.toml为：\n",
+  "keywords": [
+    "linux"
+  ],
+  "articleBody": " 前言 最近入手了一款外观复古的松下机器。想着把linux装在上面，但只要一进linux系统，风扇便开始狂转，吵得难以使用下去。\n一开始以为是驱动的问题，但手动编译了多次内核依然如故，于是便在网上另辟蹊径。经过一番苦苦搜索，最终在这里发现了解决问题的思路：\n#!/bin/shell c(){ echo \"$1\" | tee /proc/acpi/call \u003e/dev/null \u0026\u0026 cat /proc/acpi/call;echo;} c '\\_SB.PCI0.LPCB.EC0.EC88 0xB5 0x79 0x05 0x00' c '\\_SB.PCI0.LPCB.EC0.TFN1._FSL 0' 原文作者说在他的QV9和SR4上面 0xB5 0x79 0x05 0x00 能将风扇设置为静音模式， _FSL 能手动设置风扇速度（上述PCI0在我的SV1上需要换成PC00）。\n不过可惜的是， 发送 0xB5 0x79 0x05 0x00 后，电脑直接关闭风扇了。又再折腾几次，发觉该指令在我机器上反倒类似于获取风扇控制权，无奈只好往手动控制风扇上开拓思路。\n藉由AI的帮助，用rust勉强完成了一个还算能用的风扇守护程序：\nuse std::fs::{self, File}; use std::io; use std::os::unix::fs::FileExt; use std::path::{Path, PathBuf}; use std::sync::atomic::{AtomicBool, Ordering}; use std::time::{Duration, Instant}; const ACPI: \u0026str = \"/proc/acpi/call\"; const EC_ON: \u0026[u8] = b\"\\\\_SB.PC00.LPCB.EC0.EC88 0xB5 0x79 0x05 0x00\"; const EC_OFF: \u0026[u8] = b\"\\\\_SB.PC00.LPCB.EC0.EC88 0xB5 0x79 0x00 0x00\"; const COOLDOWN: Duration = Duration::from_secs(2); const RETRY: Duration = Duration::from_secs(1); struct Tier { up: i32, dn: i32, cmd: \u0026'static [u8], poll: Duration } const TIERS: \u0026[Tier] = \u0026[ Tier { up: 100, dn: 77, cmd: b\"\\\\_SB.PC00.LPCB.EC0.TFN1._FSL 100\", poll: Duration::from_millis(300) }, Tier { up: 85, dn: 67, cmd: b\"\\\\_SB.PC00.LPCB.EC0.TFN1._FSL 90\", poll: Duration::from_millis(500) }, Tier { up: 75, dn: 59, cmd: b\"\\\\_SB.PC00.LPCB.EC0.TFN1._FSL 75\", poll: Duration::from_millis(800) }, Tier { up: 68, dn: 53, cmd: b\"\\\\_SB.PC00.LPCB.EC0.TFN1._FSL 62\", poll: Duration::from_millis(1000) }, Tier { up: 62, dn: 48, cmd: b\"\\\\_SB.PC00.LPCB.EC0.TFN1._FSL 55\", poll: Duration::from_millis(1000) }, Tier { up: 57, dn: 41, cmd: b\"\\\\_SB.PC00.LPCB.EC0.TFN1._FSL 50\", poll: Duration::from_millis(1000) }, Tier { up: 50, dn: 34, cmd: b\"\\\\_SB.PC00.LPCB.EC0.TFN1._FSL 45\", poll: Duration::from_millis(1000) }, Tier { up: 43, dn: 0, cmd: b\"\\\\_SB.PC00.LPCB.EC0.TFN1._FSL 40\", poll: Duration::from_millis(1000) }, ]; static RUNNING: AtomicBool = AtomicBool::new(true); extern \"C\" fn stop(_: libc::c_int) { RUNNING.store(false, Ordering::Relaxed); } struct Devices { acpi: File, temp: File, smooth: Option\u003ci32\u003e, } impl Devices { // 构造即代表\"EC_ON 已成功发出\"，Drop 发送 EC_OFF 的前提由此保证 fn open(tp: \u0026Path, tier_cmd: \u0026[u8]) -\u003e Option\u003cSelf\u003e { let acpi = File::options().write(true).open(ACPI).ok()?; acpi.write_at(EC_ON, 0).ok()?; acpi.write_at(tier_cmd, 0).ok()?; Some(Self { acpi, temp: File::open(tp).ok()?, smooth: None, }) } fn write_acpi(\u0026self, cmd: \u0026[u8]) -\u003e io::Result\u003c()\u003e { self.acpi.write_at(cmd, 0).map(|_| ()) } fn read_temp(\u0026self) -\u003e Option\u003ci32\u003e { let mut buf = [0u8; 16]; let n = self.temp.read_at(\u0026mut buf, 0).ok()?; std::str::from_utf8(\u0026buf[..n]).ok()? .trim() .parse::\u003ci32\u003e().ok() .map(|v| v / 1000) } } // Devices 存在 ⟺ EC_ON 已激活，生命周期与资源激活周期精确对应 impl Drop for Devices { fn drop(\u0026mut self) { let _ = self.acpi.write_at(EC_OFF, 0); } } fn find_temp_path() -\u003e PathBuf { fs::read_dir(\"/sys/class/thermal\") .expect(\"Cannot read /sys/class/thermal\") .filter_map(|e| e.ok()) .find_map(|e| { let mut p = e.path(); p.push(\"type\"); let ok = fs::read_to_string(\u0026p).is_ok_and(|t| t.contains(\"pkg_temp\")); p.set_file_name(\"temp\"); ok.then_some(p) }) .expect(\"No pkg_temp thermal zone\") } fn decide(lvl: usize, s: i32, elapsed: Duration) -\u003e usize { if lvl \u003e 0 \u0026\u0026 s \u003e= TIERS[lvl].up { return (0..lvl).rev().find(|\u0026i| s \u003c TIERS[i].up).unwrap_or(0); } if s \u003c TIERS[lvl].dn \u0026\u0026 elapsed \u003e COOLDOWN { return (lvl..TIERS.len()).find(|\u0026i| s \u003e= TIERS[i].dn).unwrap(); } lvl } fn tick(d: \u0026mut Devices, lvl: usize, elapsed: Duration) -\u003e Option\u003cusize\u003e { let temp = d.read_temp()?; let s = d.smooth.get_or_insert(temp); ,*s = if temp \u003e *s { (temp + *s + 1) \u003e\u003e 1 } else { (temp + 7 * *s + 4) \u003e\u003e 3 }; let new = decide(lvl, *s, elapsed); if new != lvl \u0026\u0026 d.write_acpi(TIERS[new].cmd).is_err() { return None; } Some(new) } fn main() { if unsafe { libc::geteuid() } != 0 { eprintln!(\"Root required\"); std::process::exit(1); } unsafe { let mut sa: libc::sigaction = std::mem::zeroed(); sa.sa_sigaction = stop as *const () as libc::sighandler_t; libc::sigaction(libc::SIGINT, \u0026sa, std::ptr::null_mut()); libc::sigaction(libc::SIGTERM, \u0026sa, std::ptr::null_mut()); } let tp = find_temp_path(); let mut devices: Option\u003cDevices\u003e = None; let mut lvl = TIERS.len() - 1; let mut last = Instant::now() - COOLDOWN; while RUNNING.load(Ordering::Relaxed) { // ── 长效句柄：仅在断开时重建 ───────────────────────────────────── if devices.is_none() { match Devices::open(\u0026tp, TIERS[lvl].cmd) { None =\u003e { std::thread::sleep(RETRY); continue; } Some(d) =\u003e { devices = Some(d); } } } // ── 采样、决策、写入 ───────────────────────────────────────────── let now = Instant::now(); let d = devices.as_mut().expect(\"devices guaranteed Some after setup\"); match tick(d, lvl, now.duration_since(last)) { Some(new) =\u003e { if new != lvl { lvl = new; last = now; } } None =\u003e { devices = None; continue; } } std::thread::sleep(TIERS[lvl].poll); } // devices 在此 drop，Drop impl 自动发送 EC_OFF } 具体步骤 安装acpi_call内核模块，确定 lsmod | grep acpi_call 会输出acpi_call 编译rust代码，个人所用的Cargo.toml为：\n[package] name = \"fan-controld\" version = \"0.1.0\" edition = \"2021\" authors = [\"Your Name\"] description = \"ACPI fan control daemon\" [dependencies] libc = \"0.2\" [profile.release] opt-level = \"z\" lto = true codegen-units = 1 strip = true panic = \"abort\" 想要静态链接，可选用musl\n3.开机自启，以及唤醒后重新启动 我的系统是slackware，启动时所用脚本为：\n#!/bin/sh # # /etc/rc.d/rc.fan-controld # Initialization script for the custom ACPI fan control daemon. DAEMON=\"/usr/local/sbin/fan-controld\" PIDFILE=\"/var/run/fan-controld.pid\" fan_start() { if [ -f \"$PIDFILE\" ] \u0026\u0026 kill -0 $(cat \"$PIDFILE\") 2\u003e/dev/null; then echo \"fan-controld is already running (PID: $(cat $PIDFILE)).\" return fi if [ ! -x \"$DAEMON\" ]; then echo \"Error: Daemon binary not found or not executable at $DAEMON.\" exit 1 fi echo \"Starting fan-controld...\" nohup \"$DAEMON\" \u003e /dev/null 2\u003e\u00261 \u0026 echo $! \u003e \"$PIDFILE\" } fan_stop() { if [ ! -f \"$PIDFILE\" ]; then echo \"fan-controld is not running (no PID file).\" return fi PID=$(cat \"$PIDFILE\") if kill -0 \"$PID\" 2\u003e/dev/null; then echo \"Stopping fan-controld (PID: $PID)...\" kill -TERM \"$PID\" sleep 1 else echo \"fan-controld is not running, cleaning up stale PID file.\" fi rm -f \"$PIDFILE\" } fan_status() { if [ -f \"$PIDFILE\" ] \u0026\u0026 kill -0 $(cat \"$PIDFILE\") 2\u003e/dev/null; then echo \"fan-controld is running (PID: $(cat $PIDFILE)).\" else echo \"fan-controld is stopped.\" fi } case \"$1\" in 'start') fan_start ;; 'stop') fan_stop ;; 'restart') fan_stop sleep 1 fan_start ;; 'status') fan_status ;; ,*) echo \"Usage: $0 {start|stop|restart|status}\" exit 1 ;; esac 由于睡眠后会重置风扇控制权，我直接为elogind加了一个钩子：\n#!/bin/sh # /lib64/elogind/system-sleep/fan-control.sh # Hook to restart fan-controld during suspend/resume if [ -x /etc/rc.d/rc.fan-controld ]; then /etc/rc.d/rc.fan-controld restart fi ",
+  "wordCount" : "859",
+  "inLanguage": "en",
+  "datePublished": "0001-01-01T00:00:00Z",
+  "dateModified": "0001-01-01T00:00:00Z",
+  "mainEntityOfPage": {
+    "@type": "WebPage",
+    "@id": "https://forcol.github.io/posts/panasonic-lets-note-sv1-linux%E9%A3%8E%E6%89%87%E9%97%AE%E9%A2%98%E8%A7%A3%E5%86%B3/"
+  },
+  "publisher": {
+    "@type": "Organization",
+    "name": "forcol的日记",
+    "logo": {
+      "@type": "ImageObject",
+      "url": "https://forcol.github.io/favicon.ico"
+    }
+  }
+}
+</script>
+</head>
+<body id="top">
+    <header class="header">
+    <nav class="header-nav">
+        <div class="logo">
+            <a href="https://forcol.github.io/" accesskey="h" title="forcol的日记 (Alt + H)">forcol的日记</a>
+        </div>
+        <ul id="menu" class="menu">
+            <li>
+                <a href="https://forcol.github.io/posts/" title="文章">
+                    <span>文章</span>
+                </a>
+            </li>
+        </ul>
+    </nav>
+</header>
+<main class="main">
+
+<article class="post-single">
+  <header class="post-header">
+    
+    <h1 class="post-title entry-hint-parent">
+      Panasonic Let&#39;s note SV1 Linux风扇问题解决
+    </h1>
+  </header> 
+  <div class="post-content md-content">
+<div id="outline-container-headline-1" class="outline-2">
+<h2 id="headline-1">
+前言
+</h2>
+<div id="outline-text-headline-1" class="outline-text-2">
+<p>最近入手了一款外观复古的松下机器。想着把linux装在上面，但只要一进linux系统，风扇便开始狂转，吵得难以使用下去。</p>
+<p>
+一开始以为是驱动的问题，但手动编译了多次内核依然如故，于是便在网上另辟蹊径。经过一番苦苦搜索，最终在<a href="https://github.com/Mikejmoffitt/sr3-linux/issues/1#issuecomment-4133921162">这里</a>发现了解决问题的思路：</p>
+<div class="src src-shell">
+<div class="highlight"><pre tabindex="0" class="chroma"><code class="language-shell" data-lang="shell"><span class="line"><span class="cl">  <span class="c1">#!/bin/shell</span>
+</span></span><span class="line"><span class="cl">  c<span class="o">(){</span> <span class="nb">echo</span> <span class="s2">&#34;</span><span class="nv">$1</span><span class="s2">&#34;</span> <span class="p">|</span> tee /proc/acpi/call &gt;/dev/null <span class="o">&amp;&amp;</span> cat /proc/acpi/call<span class="p">;</span>echo<span class="p">;</span><span class="o">}</span>
+</span></span><span class="line"><span class="cl">  c <span class="s1">&#39;\_SB.PCI0.LPCB.EC0.EC88 0xB5 0x79 0x05 0x00&#39;</span>
+</span></span><span class="line"><span class="cl">  c <span class="s1">&#39;\_SB.PCI0.LPCB.EC0.TFN1._FSL 0&#39;</span></span></span></code></pre></div>
+</div>
+<p>原文作者说在他的QV9和SR4上面 <code class="verbatim">0xB5 0x79 0x05 0x00</code> 能将风扇设置为静音模式， <code class="verbatim">_FSL</code> 能手动设置风扇速度（上述PCI0在我的SV1上需要换成PC00）。</p>
+<p>
+不过可惜的是， 发送 <code class="verbatim">0xB5 0x79 0x05 0x00</code> 后，电脑直接关闭风扇了。又再折腾几次，发觉该指令在我机器上反倒类似于获取风扇控制权，无奈只好往手动控制风扇上开拓思路。</p>
+<p>
+藉由AI的帮助，用rust勉强完成了一个还算能用的风扇守护程序：</p>
+<div class="src src-rust">
+<div class="highlight"><pre tabindex="0" class="chroma"><code class="language-rust" data-lang="rust"><span class="line"><span class="cl"><span class="w">  </span><span class="k">use</span><span class="w"> </span><span class="n">std</span>::<span class="n">fs</span>::<span class="p">{</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">File</span><span class="p">};</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="k">use</span><span class="w"> </span><span class="n">std</span>::<span class="n">io</span><span class="p">;</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="k">use</span><span class="w"> </span><span class="n">std</span>::<span class="n">os</span>::<span class="n">unix</span>::<span class="n">fs</span>::<span class="n">FileExt</span><span class="p">;</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="k">use</span><span class="w"> </span><span class="n">std</span>::<span class="n">path</span>::<span class="p">{</span><span class="n">Path</span><span class="p">,</span><span class="w"> </span><span class="n">PathBuf</span><span class="p">};</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="k">use</span><span class="w"> </span><span class="n">std</span>::<span class="n">sync</span>::<span class="n">atomic</span>::<span class="p">{</span><span class="n">AtomicBool</span><span class="p">,</span><span class="w"> </span><span class="n">Ordering</span><span class="p">};</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="k">use</span><span class="w"> </span><span class="n">std</span>::<span class="n">time</span>::<span class="p">{</span><span class="n">Duration</span><span class="p">,</span><span class="w"> </span><span class="n">Instant</span><span class="p">};</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="k">const</span><span class="w"> </span><span class="no">ACPI</span>:     <span class="kp">&amp;</span><span class="kt">str</span>     <span class="o">=</span><span class="w"> </span><span class="s">&#34;/proc/acpi/call&#34;</span><span class="p">;</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="k">const</span><span class="w"> </span><span class="no">EC_ON</span>:    <span class="kp">&amp;</span><span class="p">[</span><span class="kt">u8</span><span class="p">]</span><span class="w">    </span><span class="o">=</span><span class="w"> </span><span class="sa">b</span><span class="s">&#34;</span><span class="se">\\</span><span class="s">_SB.PC00.LPCB.EC0.EC88 0xB5 0x79 0x05 0x00&#34;</span><span class="p">;</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="k">const</span><span class="w"> </span><span class="no">EC_OFF</span>:   <span class="kp">&amp;</span><span class="p">[</span><span class="kt">u8</span><span class="p">]</span><span class="w">    </span><span class="o">=</span><span class="w"> </span><span class="sa">b</span><span class="s">&#34;</span><span class="se">\\</span><span class="s">_SB.PC00.LPCB.EC0.EC88 0xB5 0x79 0x00 0x00&#34;</span><span class="p">;</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="k">const</span><span class="w"> </span><span class="no">COOLDOWN</span>: <span class="nc">Duration</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Duration</span>::<span class="n">from_secs</span><span class="p">(</span><span class="mi">2</span><span class="p">);</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="k">const</span><span class="w"> </span><span class="no">RETRY</span>:    <span class="nc">Duration</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Duration</span>::<span class="n">from_secs</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="k">struct</span> <span class="nc">Tier</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">up</span>: <span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="n">dn</span>: <span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="n">cmd</span>: <span class="kp">&amp;</span><span class="nb">&#39;static</span> <span class="p">[</span><span class="kt">u8</span><span class="p">],</span><span class="w"> </span><span class="n">poll</span>: <span class="nc">Duration</span><span class="w"> </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="k">const</span><span class="w"> </span><span class="no">TIERS</span>: <span class="kp">&amp;</span><span class="p">[</span><span class="n">Tier</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="p">[</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="n">Tier</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">up</span>: <span class="mi">100</span><span class="p">,</span><span class="w"> </span><span class="n">dn</span>: <span class="mi">77</span><span class="p">,</span><span class="w"> </span><span class="n">cmd</span>: <span class="nc">b</span><span class="s">&#34;</span><span class="se">\\</span><span class="s">_SB.PC00.LPCB.EC0.TFN1._FSL 100&#34;</span><span class="p">,</span><span class="w"> </span><span class="n">poll</span>: <span class="nc">Duration</span>::<span class="n">from_millis</span><span class="p">(</span><span class="mi">300</span><span class="p">)</span><span class="w">  </span><span class="p">},</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="n">Tier</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">up</span>: <span class="mi">85</span><span class="p">,</span><span class="w">  </span><span class="n">dn</span>: <span class="mi">67</span><span class="p">,</span><span class="w"> </span><span class="n">cmd</span>: <span class="nc">b</span><span class="s">&#34;</span><span class="se">\\</span><span class="s">_SB.PC00.LPCB.EC0.TFN1._FSL 90&#34;</span><span class="p">,</span><span class="w">  </span><span class="n">poll</span>: <span class="nc">Duration</span>::<span class="n">from_millis</span><span class="p">(</span><span class="mi">500</span><span class="p">)</span><span class="w">  </span><span class="p">},</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="n">Tier</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">up</span>: <span class="mi">75</span><span class="p">,</span><span class="w">  </span><span class="n">dn</span>: <span class="mi">59</span><span class="p">,</span><span class="w"> </span><span class="n">cmd</span>: <span class="nc">b</span><span class="s">&#34;</span><span class="se">\\</span><span class="s">_SB.PC00.LPCB.EC0.TFN1._FSL 75&#34;</span><span class="p">,</span><span class="w">  </span><span class="n">poll</span>: <span class="nc">Duration</span>::<span class="n">from_millis</span><span class="p">(</span><span class="mi">800</span><span class="p">)</span><span class="w">  </span><span class="p">},</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="n">Tier</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">up</span>: <span class="mi">68</span><span class="p">,</span><span class="w">  </span><span class="n">dn</span>: <span class="mi">53</span><span class="p">,</span><span class="w"> </span><span class="n">cmd</span>: <span class="nc">b</span><span class="s">&#34;</span><span class="se">\\</span><span class="s">_SB.PC00.LPCB.EC0.TFN1._FSL 62&#34;</span><span class="p">,</span><span class="w">  </span><span class="n">poll</span>: <span class="nc">Duration</span>::<span class="n">from_millis</span><span class="p">(</span><span class="mi">1000</span><span class="p">)</span><span class="w"> </span><span class="p">},</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="n">Tier</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">up</span>: <span class="mi">62</span><span class="p">,</span><span class="w">  </span><span class="n">dn</span>: <span class="mi">48</span><span class="p">,</span><span class="w"> </span><span class="n">cmd</span>: <span class="nc">b</span><span class="s">&#34;</span><span class="se">\\</span><span class="s">_SB.PC00.LPCB.EC0.TFN1._FSL 55&#34;</span><span class="p">,</span><span class="w">  </span><span class="n">poll</span>: <span class="nc">Duration</span>::<span class="n">from_millis</span><span class="p">(</span><span class="mi">1000</span><span class="p">)</span><span class="w"> </span><span class="p">},</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="n">Tier</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">up</span>: <span class="mi">57</span><span class="p">,</span><span class="w">  </span><span class="n">dn</span>: <span class="mi">41</span><span class="p">,</span><span class="w"> </span><span class="n">cmd</span>: <span class="nc">b</span><span class="s">&#34;</span><span class="se">\\</span><span class="s">_SB.PC00.LPCB.EC0.TFN1._FSL 50&#34;</span><span class="p">,</span><span class="w">  </span><span class="n">poll</span>: <span class="nc">Duration</span>::<span class="n">from_millis</span><span class="p">(</span><span class="mi">1000</span><span class="p">)</span><span class="w"> </span><span class="p">},</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="n">Tier</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">up</span>: <span class="mi">50</span><span class="p">,</span><span class="w">  </span><span class="n">dn</span>: <span class="mi">34</span><span class="p">,</span><span class="w"> </span><span class="n">cmd</span>: <span class="nc">b</span><span class="s">&#34;</span><span class="se">\\</span><span class="s">_SB.PC00.LPCB.EC0.TFN1._FSL 45&#34;</span><span class="p">,</span><span class="w">  </span><span class="n">poll</span>: <span class="nc">Duration</span>::<span class="n">from_millis</span><span class="p">(</span><span class="mi">1000</span><span class="p">)</span><span class="w"> </span><span class="p">},</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="n">Tier</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">up</span>: <span class="mi">43</span><span class="p">,</span><span class="w">  </span><span class="n">dn</span>: <span class="mi">0</span><span class="p">,</span><span class="w">  </span><span class="n">cmd</span>: <span class="nc">b</span><span class="s">&#34;</span><span class="se">\\</span><span class="s">_SB.PC00.LPCB.EC0.TFN1._FSL 40&#34;</span><span class="p">,</span><span class="w">  </span><span class="n">poll</span>: <span class="nc">Duration</span>::<span class="n">from_millis</span><span class="p">(</span><span class="mi">1000</span><span class="p">)</span><span class="w"> </span><span class="p">},</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="p">];</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="k">static</span><span class="w"> </span><span class="no">RUNNING</span>: <span class="nc">AtomicBool</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">AtomicBool</span>::<span class="n">new</span><span class="p">(</span><span class="kc">true</span><span class="p">);</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="k">extern</span><span class="w"> </span><span class="s">&#34;C&#34;</span><span class="w"> </span><span class="k">fn</span> <span class="nf">stop</span><span class="p">(</span><span class="n">_</span>: <span class="nc">libc</span>::<span class="n">c_int</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="no">RUNNING</span><span class="p">.</span><span class="n">store</span><span class="p">(</span><span class="kc">false</span><span class="p">,</span><span class="w"> </span><span class="n">Ordering</span>::<span class="n">Relaxed</span><span class="p">);</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="k">struct</span> <span class="nc">Devices</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="n">acpi</span>:   <span class="nc">File</span><span class="p">,</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="n">temp</span>:   <span class="nc">File</span><span class="p">,</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="n">smooth</span>: <span class="nb">Option</span><span class="o">&lt;</span><span class="kt">i32</span><span class="o">&gt;</span><span class="p">,</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="k">impl</span><span class="w"> </span><span class="n">Devices</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="c1">// 构造即代表&#34;EC_ON 已成功发出&#34;，Drop 发送 EC_OFF 的前提由此保证
+</span></span></span><span class="line"><span class="cl"><span class="c1"></span><span class="w">      </span><span class="k">fn</span> <span class="nf">open</span><span class="p">(</span><span class="n">tp</span>: <span class="kp">&amp;</span><span class="nc">Path</span><span class="p">,</span><span class="w"> </span><span class="n">tier_cmd</span>: <span class="kp">&amp;</span><span class="p">[</span><span class="kt">u8</span><span class="p">])</span><span class="w"> </span>-&gt; <span class="nb">Option</span><span class="o">&lt;</span><span class="bp">Self</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="kd">let</span><span class="w"> </span><span class="n">acpi</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">File</span>::<span class="n">options</span><span class="p">().</span><span class="n">write</span><span class="p">(</span><span class="kc">true</span><span class="p">).</span><span class="n">open</span><span class="p">(</span><span class="no">ACPI</span><span class="p">).</span><span class="n">ok</span><span class="p">()</span><span class="o">?</span><span class="p">;</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="n">acpi</span><span class="p">.</span><span class="n">write_at</span><span class="p">(</span><span class="no">EC_ON</span><span class="p">,</span><span class="w">    </span><span class="mi">0</span><span class="p">).</span><span class="n">ok</span><span class="p">()</span><span class="o">?</span><span class="p">;</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="n">acpi</span><span class="p">.</span><span class="n">write_at</span><span class="p">(</span><span class="n">tier_cmd</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">).</span><span class="n">ok</span><span class="p">()</span><span class="o">?</span><span class="p">;</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="nb">Some</span><span class="p">(</span><span class="bp">Self</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">              </span><span class="n">acpi</span><span class="p">,</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">              </span><span class="n">temp</span>:   <span class="nc">File</span>::<span class="n">open</span><span class="p">(</span><span class="n">tp</span><span class="p">).</span><span class="n">ok</span><span class="p">()</span><span class="o">?</span><span class="p">,</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">              </span><span class="n">smooth</span>: <span class="nb">None</span><span class="p">,</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="p">})</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="k">fn</span> <span class="nf">write_acpi</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">cmd</span>: <span class="kp">&amp;</span><span class="p">[</span><span class="kt">u8</span><span class="p">])</span><span class="w"> </span>-&gt; <span class="nc">io</span>::<span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="bp">self</span><span class="p">.</span><span class="n">acpi</span><span class="p">.</span><span class="n">write_at</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">).</span><span class="n">map</span><span class="p">(</span><span class="o">|</span><span class="n">_</span><span class="o">|</span><span class="w"> </span><span class="p">())</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="k">fn</span> <span class="nf">read_temp</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Option</span><span class="o">&lt;</span><span class="kt">i32</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">buf</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="mi">0</span><span class="k">u8</span><span class="p">;</span><span class="w"> </span><span class="mi">16</span><span class="p">];</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="kd">let</span><span class="w"> </span><span class="n">n</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">temp</span><span class="p">.</span><span class="n">read_at</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">).</span><span class="n">ok</span><span class="p">()</span><span class="o">?</span><span class="p">;</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="n">std</span>::<span class="kt">str</span>::<span class="n">from_utf8</span><span class="p">(</span><span class="o">&amp;</span><span class="n">buf</span><span class="p">[</span><span class="o">..</span><span class="n">n</span><span class="p">]).</span><span class="n">ok</span><span class="p">()</span><span class="o">?</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">              </span><span class="p">.</span><span class="n">trim</span><span class="p">()</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">              </span><span class="p">.</span><span class="n">parse</span>::<span class="o">&lt;</span><span class="kt">i32</span><span class="o">&gt;</span><span class="p">().</span><span class="n">ok</span><span class="p">()</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">              </span><span class="p">.</span><span class="n">map</span><span class="p">(</span><span class="o">|</span><span class="n">v</span><span class="o">|</span><span class="w"> </span><span class="n">v</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">1000</span><span class="p">)</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="c1">// Devices 存在 ⟺ EC_ON 已激活，生命周期与资源激活周期精确对应
+</span></span></span><span class="line"><span class="cl"><span class="c1"></span><span class="w">  </span><span class="k">impl</span><span class="w"> </span><span class="nb">Drop</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">Devices</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="k">fn</span> <span class="nf">drop</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="kd">let</span><span class="w"> </span><span class="n">_</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">acpi</span><span class="p">.</span><span class="n">write_at</span><span class="p">(</span><span class="no">EC_OFF</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="k">fn</span> <span class="nf">find_temp_path</span><span class="p">()</span><span class="w"> </span>-&gt; <span class="nc">PathBuf</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="n">fs</span>::<span class="n">read_dir</span><span class="p">(</span><span class="s">&#34;/sys/class/thermal&#34;</span><span class="p">)</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="p">.</span><span class="n">expect</span><span class="p">(</span><span class="s">&#34;Cannot read /sys/class/thermal&#34;</span><span class="p">)</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="p">.</span><span class="n">filter_map</span><span class="p">(</span><span class="o">|</span><span class="n">e</span><span class="o">|</span><span class="w"> </span><span class="n">e</span><span class="p">.</span><span class="n">ok</span><span class="p">())</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="p">.</span><span class="n">find_map</span><span class="p">(</span><span class="o">|</span><span class="n">e</span><span class="o">|</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">              </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">e</span><span class="p">.</span><span class="n">path</span><span class="p">();</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">              </span><span class="n">p</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="s">&#34;type&#34;</span><span class="p">);</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">              </span><span class="kd">let</span><span class="w"> </span><span class="n">ok</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fs</span>::<span class="n">read_to_string</span><span class="p">(</span><span class="o">&amp;</span><span class="n">p</span><span class="p">).</span><span class="n">is_ok_and</span><span class="p">(</span><span class="o">|</span><span class="n">t</span><span class="o">|</span><span class="w"> </span><span class="n">t</span><span class="p">.</span><span class="n">contains</span><span class="p">(</span><span class="s">&#34;pkg_temp&#34;</span><span class="p">));</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">              </span><span class="n">p</span><span class="p">.</span><span class="n">set_file_name</span><span class="p">(</span><span class="s">&#34;temp&#34;</span><span class="p">);</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">              </span><span class="n">ok</span><span class="p">.</span><span class="n">then_some</span><span class="p">(</span><span class="n">p</span><span class="p">)</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="p">})</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="p">.</span><span class="n">expect</span><span class="p">(</span><span class="s">&#34;No pkg_temp thermal zone&#34;</span><span class="p">)</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="k">fn</span> <span class="nf">decide</span><span class="p">(</span><span class="n">lvl</span>: <span class="kt">usize</span><span class="p">,</span><span class="w"> </span><span class="n">s</span>: <span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="n">elapsed</span>: <span class="nc">Duration</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="kt">usize</span> <span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="k">if</span><span class="w"> </span><span class="n">lvl</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="no">TIERS</span><span class="p">[</span><span class="n">lvl</span><span class="p">].</span><span class="n">up</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="k">return</span><span class="w"> </span><span class="p">(</span><span class="mi">0</span><span class="o">..</span><span class="n">lvl</span><span class="p">).</span><span class="n">rev</span><span class="p">().</span><span class="n">find</span><span class="p">(</span><span class="o">|&amp;</span><span class="n">i</span><span class="o">|</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="no">TIERS</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">up</span><span class="p">).</span><span class="n">unwrap_or</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="k">if</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="no">TIERS</span><span class="p">[</span><span class="n">lvl</span><span class="p">].</span><span class="n">dn</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">elapsed</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="no">COOLDOWN</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="k">return</span><span class="w"> </span><span class="p">(</span><span class="n">lvl</span><span class="o">..</span><span class="no">TIERS</span><span class="p">.</span><span class="n">len</span><span class="p">()).</span><span class="n">find</span><span class="p">(</span><span class="o">|&amp;</span><span class="n">i</span><span class="o">|</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="no">TIERS</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">dn</span><span class="p">).</span><span class="n">unwrap</span><span class="p">();</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="n">lvl</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="k">fn</span> <span class="nf">tick</span><span class="p">(</span><span class="n">d</span>: <span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">Devices</span><span class="p">,</span><span class="w"> </span><span class="n">lvl</span>: <span class="kt">usize</span><span class="p">,</span><span class="w"> </span><span class="n">elapsed</span>: <span class="nc">Duration</span><span class="p">)</span><span class="w"> </span>-&gt; <span class="nb">Option</span><span class="o">&lt;</span><span class="kt">usize</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="kd">let</span><span class="w"> </span><span class="n">temp</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">d</span><span class="p">.</span><span class="n">read_temp</span><span class="p">()</span><span class="o">?</span><span class="p">;</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="kd">let</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">d</span><span class="p">.</span><span class="n">smooth</span><span class="p">.</span><span class="n">get_or_insert</span><span class="p">(</span><span class="n">temp</span><span class="p">);</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="p">,</span><span class="o">*</span><span class="n">s</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">temp</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="o">*</span><span class="n">s</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="p">(</span><span class="n">temp</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="o">*</span><span class="n">s</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span><span class="w"> </span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="p">(</span><span class="n">temp</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">7</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="o">*</span><span class="n">s</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">4</span><span class="p">)</span><span class="w"> </span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="mi">3</span><span class="w"> </span><span class="p">};</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="kd">let</span><span class="w"> </span><span class="n">new</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">decide</span><span class="p">(</span><span class="n">lvl</span><span class="p">,</span><span class="w"> </span><span class="o">*</span><span class="n">s</span><span class="p">,</span><span class="w"> </span><span class="n">elapsed</span><span class="p">);</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="k">if</span><span class="w"> </span><span class="n">new</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="n">lvl</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">d</span><span class="p">.</span><span class="n">write_acpi</span><span class="p">(</span><span class="no">TIERS</span><span class="p">[</span><span class="n">new</span><span class="p">].</span><span class="n">cmd</span><span class="p">).</span><span class="n">is_err</span><span class="p">()</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="nb">None</span><span class="p">;</span><span class="w"> </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="nb">Some</span><span class="p">(</span><span class="n">new</span><span class="p">)</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">  </span><span class="k">fn</span> <span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="k">if</span><span class="w"> </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">libc</span>::<span class="n">geteuid</span><span class="p">()</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="fm">eprintln!</span><span class="p">(</span><span class="s">&#34;Root required&#34;</span><span class="p">);</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="n">std</span>::<span class="n">process</span>::<span class="n">exit</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">sa</span>: <span class="nc">libc</span>::<span class="n">sigaction</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span>::<span class="n">mem</span>::<span class="n">zeroed</span><span class="p">();</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="n">sa</span><span class="p">.</span><span class="n">sa_sigaction</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">stop</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="o">*</span><span class="k">const</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">libc</span>::<span class="n">sighandler_t</span><span class="p">;</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="n">libc</span>::<span class="n">sigaction</span><span class="p">(</span><span class="n">libc</span>::<span class="no">SIGINT</span><span class="p">,</span><span class="w">  </span><span class="o">&amp;</span><span class="n">sa</span><span class="p">,</span><span class="w"> </span><span class="n">std</span>::<span class="n">ptr</span>::<span class="n">null_mut</span><span class="p">());</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="n">libc</span>::<span class="n">sigaction</span><span class="p">(</span><span class="n">libc</span>::<span class="no">SIGTERM</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">sa</span><span class="p">,</span><span class="w"> </span><span class="n">std</span>::<span class="n">ptr</span>::<span class="n">null_mut</span><span class="p">());</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="kd">let</span><span class="w"> </span><span class="n">tp</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">find_temp_path</span><span class="p">();</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">devices</span>: <span class="nb">Option</span><span class="o">&lt;</span><span class="n">Devices</span><span class="o">&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">None</span><span class="p">;</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">lvl</span><span class="w">  </span><span class="o">=</span><span class="w"> </span><span class="no">TIERS</span><span class="p">.</span><span class="n">len</span><span class="p">()</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">last</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Instant</span>::<span class="n">now</span><span class="p">()</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="no">COOLDOWN</span><span class="p">;</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="k">while</span><span class="w"> </span><span class="no">RUNNING</span><span class="p">.</span><span class="n">load</span><span class="p">(</span><span class="n">Ordering</span>::<span class="n">Relaxed</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="c1">// ── 长效句柄：仅在断开时重建 ─────────────────────────────────────
+</span></span></span><span class="line"><span class="cl"><span class="c1"></span><span class="w">          </span><span class="k">if</span><span class="w"> </span><span class="n">devices</span><span class="p">.</span><span class="n">is_none</span><span class="p">()</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">              </span><span class="k">match</span><span class="w"> </span><span class="n">Devices</span>::<span class="n">open</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tp</span><span class="p">,</span><span class="w"> </span><span class="no">TIERS</span><span class="p">[</span><span class="n">lvl</span><span class="p">].</span><span class="n">cmd</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">                  </span><span class="nb">None</span><span class="w">    </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">std</span>::<span class="n">thread</span>::<span class="n">sleep</span><span class="p">(</span><span class="no">RETRY</span><span class="p">);</span><span class="w"> </span><span class="k">continue</span><span class="p">;</span><span class="w"> </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">                  </span><span class="nb">Some</span><span class="p">(</span><span class="n">d</span><span class="p">)</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">devices</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">d</span><span class="p">);</span><span class="w"> </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">              </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="c1">// ── 采样、决策、写入 ─────────────────────────────────────────────
+</span></span></span><span class="line"><span class="cl"><span class="c1"></span><span class="w">          </span><span class="kd">let</span><span class="w"> </span><span class="n">now</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Instant</span>::<span class="n">now</span><span class="p">();</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="kd">let</span><span class="w"> </span><span class="n">d</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">devices</span><span class="p">.</span><span class="n">as_mut</span><span class="p">().</span><span class="n">expect</span><span class="p">(</span><span class="s">&#34;devices guaranteed Some after setup&#34;</span><span class="p">);</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="k">match</span><span class="w"> </span><span class="n">tick</span><span class="p">(</span><span class="n">d</span><span class="p">,</span><span class="w"> </span><span class="n">lvl</span><span class="p">,</span><span class="w"> </span><span class="n">now</span><span class="p">.</span><span class="n">duration_since</span><span class="p">(</span><span class="n">last</span><span class="p">))</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">              </span><span class="nb">Some</span><span class="p">(</span><span class="n">new</span><span class="p">)</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">                  </span><span class="k">if</span><span class="w"> </span><span class="n">new</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="n">lvl</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">lvl</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">new</span><span class="p">;</span><span class="w"> </span><span class="n">last</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">now</span><span class="p">;</span><span class="w"> </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">              </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">              </span><span class="nb">None</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">devices</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">None</span><span class="p">;</span><span class="w"> </span><span class="k">continue</span><span class="p">;</span><span class="w"> </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">          </span><span class="n">std</span>::<span class="n">thread</span>::<span class="n">sleep</span><span class="p">(</span><span class="no">TIERS</span><span class="p">[</span><span class="n">lvl</span><span class="p">].</span><span class="n">poll</span><span class="p">);</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="p">}</span><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">
+</span></span></span><span class="line"><span class="cl"><span class="w">      </span><span class="c1">// devices 在此 drop，Drop impl 自动发送 EC_OFF
+</span></span></span><span class="line"><span class="cl"><span class="c1"></span><span class="w">  </span><span class="p">}</span></span></span></code></pre></div>
+</div>
+</div>
+</div>
+<div id="outline-container-headline-2" class="outline-2">
+<h2 id="headline-2">
+具体步骤
+</h2>
+<div id="outline-text-headline-2" class="outline-text-2">
+<ol>
+<li>安装acpi_call内核模块，确定 <code class="verbatim">lsmod | grep acpi_call</code> 会输出acpi_call</li>
+<li>
+<p>编译rust代码，个人所用的Cargo.toml为：</p>
+<div class="src src-toml">
+<div class="highlight"><pre tabindex="0" class="chroma"><code class="language-toml" data-lang="toml"><span class="line"><span class="cl">  <span class="p">[</span><span class="nx">package</span><span class="p">]</span>
+</span></span><span class="line"><span class="cl">  <span class="nx">name</span> <span class="p">=</span> <span class="s2">&#34;fan-controld&#34;</span>
+</span></span><span class="line"><span class="cl">  <span class="nx">version</span> <span class="p">=</span> <span class="s2">&#34;0.1.0&#34;</span>
+</span></span><span class="line"><span class="cl">  <span class="nx">edition</span> <span class="p">=</span> <span class="s2">&#34;2021&#34;</span>
+</span></span><span class="line"><span class="cl">  <span class="nx">authors</span> <span class="p">=</span> <span class="p">[</span><span class="s2">&#34;Your Name&#34;</span><span class="p">]</span>
+</span></span><span class="line"><span class="cl">  <span class="nx">description</span> <span class="p">=</span> <span class="s2">&#34;ACPI fan control daemon&#34;</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">  <span class="p">[</span><span class="nx">dependencies</span><span class="p">]</span>
+</span></span><span class="line"><span class="cl">  <span class="nx">libc</span> <span class="p">=</span> <span class="s2">&#34;0.2&#34;</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">  <span class="p">[</span><span class="nx">profile</span><span class="p">.</span><span class="nx">release</span><span class="p">]</span>
+</span></span><span class="line"><span class="cl">  <span class="nx">opt-level</span> <span class="p">=</span> <span class="s2">&#34;z&#34;</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">  <span class="nx">lto</span> <span class="p">=</span> <span class="kc">true</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">  <span class="nx">codegen-units</span> <span class="p">=</span> <span class="mi">1</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">  <span class="nx">strip</span> <span class="p">=</span> <span class="kc">true</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">  <span class="nx">panic</span> <span class="p">=</span> <span class="s2">&#34;abort&#34;</span></span></span></code></pre></div>
+</div>
+</li>
+</ol>
+<p>想要静态链接，可选用musl</p>
+<p>
+3.开机自启，以及唤醒后重新启动
+我的系统是slackware，启动时所用脚本为：</p>
+<div class="src src-shell">
+<div class="highlight"><pre tabindex="0" class="chroma"><code class="language-shell" data-lang="shell"><span class="line"><span class="cl">  <span class="c1">#!/bin/sh</span>
+</span></span><span class="line"><span class="cl">  <span class="c1">#</span>
+</span></span><span class="line"><span class="cl">  <span class="c1"># /etc/rc.d/rc.fan-controld</span>
+</span></span><span class="line"><span class="cl">  <span class="c1"># Initialization script for the custom ACPI fan control daemon.</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">  <span class="nv">DAEMON</span><span class="o">=</span><span class="s2">&#34;/usr/local/sbin/fan-controld&#34;</span>
+</span></span><span class="line"><span class="cl">  <span class="nv">PIDFILE</span><span class="o">=</span><span class="s2">&#34;/var/run/fan-controld.pid&#34;</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">  fan_start<span class="o">()</span> <span class="o">{</span>
+</span></span><span class="line"><span class="cl">    <span class="k">if</span> <span class="o">[</span> -f <span class="s2">&#34;</span><span class="nv">$PIDFILE</span><span class="s2">&#34;</span> <span class="o">]</span> <span class="o">&amp;&amp;</span> <span class="nb">kill</span> -0 <span class="k">$(</span>cat <span class="s2">&#34;</span><span class="nv">$PIDFILE</span><span class="s2">&#34;</span><span class="k">)</span> 2&gt;/dev/null<span class="p">;</span>
+</span></span><span class="line"><span class="cl">    <span class="k">then</span>
+</span></span><span class="line"><span class="cl">      <span class="nb">echo</span> <span class="s2">&#34;fan-controld is already running (PID: </span><span class="k">$(</span>cat <span class="nv">$PIDFILE</span><span class="k">)</span><span class="s2">).&#34;</span>
+</span></span><span class="line"><span class="cl">      <span class="k">return</span>
+</span></span><span class="line"><span class="cl">    <span class="k">fi</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">    <span class="k">if</span> <span class="o">[</span> ! -x <span class="s2">&#34;</span><span class="nv">$DAEMON</span><span class="s2">&#34;</span> <span class="o">]</span><span class="p">;</span>
+</span></span><span class="line"><span class="cl">    <span class="k">then</span>
+</span></span><span class="line"><span class="cl">      <span class="nb">echo</span> <span class="s2">&#34;Error: Daemon binary not found or not executable at </span><span class="nv">$DAEMON</span><span class="s2">.&#34;</span>
+</span></span><span class="line"><span class="cl">      <span class="nb">exit</span> <span class="m">1</span>
+</span></span><span class="line"><span class="cl">    <span class="k">fi</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">    <span class="nb">echo</span> <span class="s2">&#34;Starting fan-controld...&#34;</span>
+</span></span><span class="line"><span class="cl">    nohup <span class="s2">&#34;</span><span class="nv">$DAEMON</span><span class="s2">&#34;</span> &gt; /dev/null 2&gt;<span class="p">&amp;</span><span class="m">1</span> <span class="p">&amp;</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">    <span class="nb">echo</span> <span class="nv">$!</span> &gt; <span class="s2">&#34;</span><span class="nv">$PIDFILE</span><span class="s2">&#34;</span>
+</span></span><span class="line"><span class="cl">  <span class="o">}</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">  fan_stop<span class="o">()</span> <span class="o">{</span>
+</span></span><span class="line"><span class="cl">    <span class="k">if</span> <span class="o">[</span> ! -f <span class="s2">&#34;</span><span class="nv">$PIDFILE</span><span class="s2">&#34;</span> <span class="o">]</span><span class="p">;</span>
+</span></span><span class="line"><span class="cl">    <span class="k">then</span>
+</span></span><span class="line"><span class="cl">      <span class="nb">echo</span> <span class="s2">&#34;fan-controld is not running (no PID file).&#34;</span>
+</span></span><span class="line"><span class="cl">      <span class="k">return</span>
+</span></span><span class="line"><span class="cl">    <span class="k">fi</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">    <span class="nv">PID</span><span class="o">=</span><span class="k">$(</span>cat <span class="s2">&#34;</span><span class="nv">$PIDFILE</span><span class="s2">&#34;</span><span class="k">)</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">    <span class="k">if</span> <span class="nb">kill</span> -0 <span class="s2">&#34;</span><span class="nv">$PID</span><span class="s2">&#34;</span> 2&gt;/dev/null<span class="p">;</span>
+</span></span><span class="line"><span class="cl">    <span class="k">then</span>
+</span></span><span class="line"><span class="cl">      <span class="nb">echo</span> <span class="s2">&#34;Stopping fan-controld (PID: </span><span class="nv">$PID</span><span class="s2">)...&#34;</span>
+</span></span><span class="line"><span class="cl">      <span class="nb">kill</span> -TERM <span class="s2">&#34;</span><span class="nv">$PID</span><span class="s2">&#34;</span>
+</span></span><span class="line"><span class="cl">      sleep <span class="m">1</span>
+</span></span><span class="line"><span class="cl">    <span class="k">else</span>
+</span></span><span class="line"><span class="cl">      <span class="nb">echo</span> <span class="s2">&#34;fan-controld is not running, cleaning up stale PID file.&#34;</span>
+</span></span><span class="line"><span class="cl">    <span class="k">fi</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">    rm -f <span class="s2">&#34;</span><span class="nv">$PIDFILE</span><span class="s2">&#34;</span>
+</span></span><span class="line"><span class="cl">  <span class="o">}</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">  fan_status<span class="o">()</span> <span class="o">{</span>
+</span></span><span class="line"><span class="cl">    <span class="k">if</span> <span class="o">[</span> -f <span class="s2">&#34;</span><span class="nv">$PIDFILE</span><span class="s2">&#34;</span> <span class="o">]</span> <span class="o">&amp;&amp;</span> <span class="nb">kill</span> -0 <span class="k">$(</span>cat <span class="s2">&#34;</span><span class="nv">$PIDFILE</span><span class="s2">&#34;</span><span class="k">)</span> 2&gt;/dev/null<span class="p">;</span>
+</span></span><span class="line"><span class="cl">    <span class="k">then</span>
+</span></span><span class="line"><span class="cl">      <span class="nb">echo</span> <span class="s2">&#34;fan-controld is running (PID: </span><span class="k">$(</span>cat <span class="nv">$PIDFILE</span><span class="k">)</span><span class="s2">).&#34;</span>
+</span></span><span class="line"><span class="cl">    <span class="k">else</span>
+</span></span><span class="line"><span class="cl">      <span class="nb">echo</span> <span class="s2">&#34;fan-controld is stopped.&#34;</span>
+</span></span><span class="line"><span class="cl">    <span class="k">fi</span>
+</span></span><span class="line"><span class="cl">  <span class="o">}</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">  <span class="k">case</span> <span class="s2">&#34;</span><span class="nv">$1</span><span class="s2">&#34;</span> in
+</span></span><span class="line"><span class="cl">    <span class="s1">&#39;start&#39;</span><span class="o">)</span>
+</span></span><span class="line"><span class="cl">      fan_start
+</span></span><span class="line"><span class="cl">      <span class="p">;;</span>
+</span></span><span class="line"><span class="cl">    <span class="s1">&#39;stop&#39;</span><span class="o">)</span>
+</span></span><span class="line"><span class="cl">      fan_stop
+</span></span><span class="line"><span class="cl">      <span class="p">;;</span>
+</span></span><span class="line"><span class="cl">    <span class="s1">&#39;restart&#39;</span><span class="o">)</span>
+</span></span><span class="line"><span class="cl">      fan_stop
+</span></span><span class="line"><span class="cl">      sleep <span class="m">1</span>
+</span></span><span class="line"><span class="cl">      fan_start
+</span></span><span class="line"><span class="cl">      <span class="p">;;</span>
+</span></span><span class="line"><span class="cl">    <span class="s1">&#39;status&#39;</span><span class="o">)</span>
+</span></span><span class="line"><span class="cl">      fan_status
+</span></span><span class="line"><span class="cl">      <span class="p">;;</span>
+</span></span><span class="line"><span class="cl">    ,*<span class="o">)</span>
+</span></span><span class="line"><span class="cl">      <span class="nb">echo</span> <span class="s2">&#34;Usage: </span><span class="nv">$0</span><span class="s2"> {start|stop|restart|status}&#34;</span>
+</span></span><span class="line"><span class="cl">      <span class="nb">exit</span> <span class="m">1</span>
+</span></span><span class="line"><span class="cl">      <span class="p">;;</span>
+</span></span><span class="line"><span class="cl">  <span class="k">esac</span></span></span></code></pre></div>
+</div>
+<p>由于睡眠后会重置风扇控制权，我直接为elogind加了一个钩子：</p>
+<div class="src src-shell">
+<div class="highlight"><pre tabindex="0" class="chroma"><code class="language-shell" data-lang="shell"><span class="line"><span class="cl">  <span class="c1">#!/bin/sh</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">  <span class="c1"># /lib64/elogind/system-sleep/fan-control.sh</span>
+</span></span><span class="line"><span class="cl">  <span class="c1"># Hook to restart fan-controld during suspend/resume</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">  <span class="k">if</span> <span class="o">[</span> -x /etc/rc.d/rc.fan-controld <span class="o">]</span><span class="p">;</span> <span class="k">then</span>
+</span></span><span class="line"><span class="cl">        /etc/rc.d/rc.fan-controld restart
+</span></span><span class="line"><span class="cl">  <span class="k">fi</span></span></span></code></pre></div>
+</div>
+</div>
+</div>
+
+
+  </div>
+
+  <footer class="post-footer">
+    <ul class="post-tags">
+      <li><a href="https://forcol.github.io/tags/linux/">Linux</a></li>
+    </ul>
+  </footer>
+</article>
+    </main>
+    
+<footer class="footer">
+        <span>&copy; 2026 <a href="https://forcol.github.io/">forcol的日记</a></span> · 
+
+    <span>
+        Powered by
+        <a href="https://gohugo.io/" rel="noopener noreferrer" target="_blank">Hugo</a> &
+        <a href="https://github.com/adityatelange/hugo-PaperMod/" rel="noopener" target="_blank">PaperMod</a>
+    </span>
+</footer>
+<a href="#top" id="top-link" class="top-link hidden" aria-label="go to top" title="Go to Top (Alt + G)" accesskey="g">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+        stroke-linecap="round" stroke-linejoin="round" class="feather feather-chevrons-up">
+        <polyline points="17 11 12 6 7 11"></polyline>
+        <polyline points="17 18 12 13 7 18"></polyline>
+    </svg>
+</a>
+
+<script>
+    let menu = document.getElementById('menu');
+    if (menu) {
+        
+        const scrollPosition = localStorage.getItem("menu-scroll-position");
+        if (scrollPosition) {
+            menu.scrollLeft = parseInt(scrollPosition, 10);
+        }
+        
+        menu.onscroll = function () {
+            localStorage.setItem("menu-scroll-position", menu.scrollLeft);
+        }
+    }
+
+    document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+        anchor.addEventListener("click", function (e) {
+            e.preventDefault();
+            var id = this.getAttribute("href").substr(1);
+            if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+                document.querySelector(`[id='${decodeURIComponent(id)}']`).scrollIntoView({
+                    behavior: "smooth"
+                });
+            } else {
+                document.querySelector(`[id='${decodeURIComponent(id)}']`).scrollIntoView();
+            }
+            if (id === "top") {
+                history.replaceState(null, null, " ");
+            } else {
+                history.pushState(null, null, `#${id}`);
+            }
+        });
+    });
+
+</script>
+<script>
+    var toplink = document.getElementById("top-link");
+    window.onscroll = function () {
+        const scrollThreshold = window.innerHeight;
+        if (document.body.scrollTop > scrollThreshold || document.documentElement.scrollTop > scrollThreshold) {
+            toplink.classList.remove("hidden");
+        } else {
+            toplink.classList.add("hidden");
+        }
+    };
+
+</script>
+</body>
+
+</html>
